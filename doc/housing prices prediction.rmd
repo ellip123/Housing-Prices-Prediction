@@ -1,0 +1,566 @@
+---
+title: "Housing Prices Prediction"
+author: "Xiangyu Liu"
+date: "March, 2018"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data preparation
+
+## *R* Libraries
+
+Let the fun begin!
+
+```{r, warning=FALSE, message=FALSE}
+library(ggthemes)
+library(cowplot)
+library(gridExtra)
+library(ggplot2)
+library(moments)
+library(knitr)
+library(dplyr)
+library(caret)
+library(glmnet)
+```
+
+## Importing the data
+
+```{r}
+train <- read.csv("/Users/xiangyu/Desktop/house prediction/input/train.csv",stringsAsFactors = FALSE)
+test <- read.csv("/Users/xiangyu/Desktop/house prediction/input/test.csv",stringsAsFactors = FALSE)
+allSet <- bind_rows(train,test)
+```
+
+## Imputing missing values with default, median, mode or regression
+
+First, let's see the missing values for the whole dataset.
+
+```{r}
+checkNAs <- function(df){
+        naCols <- which(colSums(is.na(df))>0)
+        sort(colSums(sapply(allSet[naCols],is.na)), decreasing = TRUE)
+}
+checkNAs(allSet)
+```
+
+Then, I will carry out imputation based on most frequent values of the missing-value features. 
+
+```{r}
+allSet$Fence[is.na(allSet$Fence)] <- "None"
+allSet$Alley[is.na(allSet$Alley)] <- "None"
+allSet$MiscFeature[is.na(allSet$MiscFeature)] <- "None"
+allSet$Utilities[is.na(allSet$Utilities)] <- "AllPub"
+allSet$Functional[is.na(allSet$Functional)] <- "Typ"
+allSet$Exterior1st[is.na(allSet$Exterior1st)] <- "VinylSd"
+allSet$Exterior2nd[is.na(allSet$Exterior2nd)] <- "VinylSd"
+```
+
+I will also carry out imputation based on other features that help predict the missing-value features. 
+
+```{r}
+fpNoQul <- allSet[is.na(allSet$FireplaceQu) & allSet$Fireplaces == 0 ,c("Fireplaces","FireplaceQu")]
+
+allSet$FireplaceQu[is.na(allSet$FireplaceQu) & allSet$Fireplaces == 0] <- "None"
+
+fp <- allSet[allSet$Fireplaces == 0 ,c("Fireplaces","FireplaceQu")]
+
+```
+
+* **LotFrontage**: 
+```{r}
+medNgbrLotFr <- allSet[!is.na(allSet$Neighborhood), c("Neighborhood","LotFrontage")] %>% 
+        group_by(Neighborhood) %>% 
+        summarize(median = median(LotFrontage, na.rm = T))
+
+rIndx <- which(is.na(allSet$LotFrontage))
+
+for(i in rIndx){
+        medVal <- medNgbrLotFr[medNgbrLotFr$Neighborhood == allSet$Neighborhood[i],"median"]
+        allSet$LotFrontage[i] <- medVal[[1]]
+}
+```
+
+* **MasVnrType** and **MasVnrArea**: 
+
+Out of 24 houses, we have 23 with missing values in both features.
+
+```{r}
+allSet$MasVnrType[is.na(allSet$MasVnrType) & is.na(allSet$MasVnrArea)] <- "None"
+allSet$MasVnrArea[is.na(allSet$MasVnrArea)] <- 0
+missArea <- allSet$MasVnrArea[is.na(allSet$MasVnrType)]
+allSet[allSet$MasVnrType != "None", c("MasVnrType","MasVnrArea")] %>% 
+        ggplot(aes(x = MasVnrType, y = MasVnrArea)) +
+        geom_boxplot()+
+        geom_hline(yintercept = missArea, color = "red")
+medMason <- allSet[allSet$MasVnrType != "None", c("MasVnrType","MasVnrArea")] %>% 
+        group_by(MasVnrType) %>% 
+        summarize(median = median(MasVnrArea))
+```
+
+The nearest masonry type to the missing values is *Stone*. Hence, I will replace the missing value by *Stone*.
+
+```{r}
+rIndx <- which(is.na(allSet$MasVnrType))
+for(i in rIndx){
+        medVal <- medMason[which((abs(medMason$median - allSet$MasVnrArea[i])) == min(abs(medMason$median - allSet$MasVnrArea[i]), na.rm = T)),"MasVnrType"]
+         allSet$MasVnrType[i] <- medVal[[1]]
+}
+```
+
+```{r,warning = FALSE}
+missZoning <- unique(allSet$MSSubClass[is.na(allSet$MSZoning)])
+```
+
+```{r}
+allSet$MSZoning[is.na(allSet$MSZoning) & allSet$MSSubClass %in% c(70,30)] <- "RM"
+allSet$MSZoning[is.na(allSet$MSZoning) & allSet$MSSubClass == 20] <- "RL"
+```
+
+* **SaleType**: 
+
+Most *Normal* SaleCondition have a *WD* SaleType. So, I'll impute the missing value with the same.
+
+```{r}
+allSet$SaleType[is.na(allSet$SaleType)] <- "WD"
+```
+
+* **Electrical**: It can be directly related to the overall condition of the house (*OverallCond*). 
+
+Most of 5-rating Overall Condition houses have *SBrkr* electrical system.
+
+```{r}
+allSet$Electrical[is.na(allSet$Electrical)] <- "SBrkr"
+```
+
+For a *KitchenAbvGr* of 1, the most likely value for a *KitchenQual* is *TA*.
+
+```{r}
+allSet$KitchenQual[is.na(allSet$KitchenQual)] <- "TA"
+```
+
+* **PoolQC**: 
+
+Out of the 2909 houses with missing PoolQC values, we have 2906 with zero PoolArea. These PoolQC values can be imputed with *None*.
+
+```{r}
+allSet$PoolQC[allSet$PoolArea == 0] <- "None"
+```
+
+Impute missing PoolQC values with the values of nearest PoolArea means.
+
+```{r}
+rIndx <- which(is.na(allSet$PoolQC) & allSet$PoolArea >0)
+meanArea <- allSet[!is.na(allSet$PoolQC),c("PoolQC","PoolArea")] %>% 
+        group_by(PoolQC) %>% 
+        summarize(AreaMean = round(mean(PoolArea),0))
+
+for(i in rIndx){
+        poolQc <- meanArea[which((abs(meanArea$AreaMean - allSet$PoolArea[i])) == min(abs(meanArea$AreaMean - allSet$PoolArea[i]), na.rm = T)),"PoolQC"]
+        allSet$PoolQC[i] <- poolQc[[1]]
+}
+```
+
+* **Garage** features: We have 7 features all related to garage and have maximum number of missing values of 159 in *GarageYrBlt* column.
+
+```{r}
+garageCols <- names(allSet)[grepl("Garage.*", names(allSet))]
+garageCols
+```
+
+I will consider houses with a complete set of *NAs* or zeros- as explained above- as houses with *None* values.
+
+```{r}
+noGarage <- which((is.na(allSet$GarageArea) | allSet$GarageArea == 0)
+                  & (is.na(allSet$GarageCars) | allSet$GarageCars == 0)
+                  & is.na(allSet$GarageCond)
+                  & is.na(allSet$GarageFinish)
+                  & is.na(allSet$GarageQual)
+                  & is.na(allSet$GarageType)
+                  & (is.na(allSet$GarageYrBlt) | allSet$GarageYrBlt == 0))
+
+allSet[noGarage,c("GarageType","GarageFinish","GarageQual","GarageCond")] <- "None"
+
+allSet[noGarage, c("GarageYrBlt","GarageCars","GarageArea")] <- 0
+
+missGarage <- which(is.na(allSet$GarageArea) 
+                    | is.na(allSet$GarageCars)
+                    | is.na(allSet$GarageCond)
+                    | is.na(allSet$GarageFinish)
+                    | is.na(allSet$GarageQual)
+                    | is.na(allSet$GarageType)
+                    | is.na(allSet$GarageYrBlt))
+```
+
+
+House *2577* is missing more values than house *2127*. Hence, I will impute its missing values first based on the matching values of houses of the same *GarageType* and *GarageYrBlt*.
+
+```{r}
+miss <- which(is.na(allSet$GarageCars) | is.na(allSet$GarageArea))
+
+grpdVals1 <- allSet%>% 
+        group_by(GarageType, GarageYrBlt, GarageFinish, GarageQual, GarageCond) %>% 
+        summarize(medCars = median(GarageCars), meanArea = round(mean(GarageArea),0),count = n()) %>% 
+        arrange(desc(count))
+comp <- complete.cases(grpdVals1)
+grpdVals1 <- grpdVals1[comp,]
+grpdVals1
+
+rIndx <- miss
+for(i in rIndx){
+    missVals <- grpdVals1[which((grpdVals1$GarageYrBlt == allSet$GarageYrBlt[i]) & (grpdVals1$GarageType == allSet$GarageType[i])),c("GarageFinish", "medCars", "meanArea", "GarageQual","GarageCond")]
+        allSet$GarageFinish[i] <- missVals[[1]][1]
+        allSet$GarageCars[i] <- missVals[[2]][1]
+        allSet$GarageArea[i] <- missVals[[3]][1]
+        allSet$GarageQual[i] <- missVals[[4]][1]
+        allSet$GarageCond[i] <- missVals[[5]][1]
+  }
+```
+
+Then I will impute its missing values *GarageFinish*, *GarageQual* and *GarageCond* with those having similar *GarageArea*, *GarageCars*, and *GarageType*.
+
+```{r}
+grpdVals <- allSet[allSet$GarageType == "Detchd" & allSet$GarageCars == 1,garageCols] %>% 
+        group_by(GarageFinish, GarageQual, GarageCond) %>% 
+        summarize(meanArea = round(mean(GarageArea),0),count = n()) %>% 
+        arrange(desc(count))
+comp <- complete.cases(grpdVals)
+grpdVals <- grpdVals[comp,]
+
+rIndx <- missGarage
+
+for(i in rIndx){
+    missVals <- grpdVals[which((abs(grpdVals$meanArea - allSet$GarageArea[i])) == min(abs(grpdVals$meanArea - allSet$GarageArea[i]),na.rm = T)),c("GarageFinish", "GarageQual","GarageCond")]
+        allSet$GarageFinish[i] <- missVals[[1]][1]
+        allSet$GarageQual[i] <- missVals[[2]][1]
+        allSet$GarageCond[i] <- missVals[[3]][1]
+  }
+
+```
+
+* **Basement** features: By studying the *data_description.txt* file, we find that there are 11 features-listed below- that describe the basements in houses.
+
+```{r}
+bsmtCols <- names(allSet)[grepl("Bsmt.*", names(allSet))]
+bsmtCols
+```
+
+First, let's check missing values in all Basement features. 
+```{r}
+bsmtAllNa <- which((allSet[,bsmtCols[1]]== 0 | is.na(allSet[,bsmtCols[1]])) &
+                        (allSet[,bsmtCols[2]]== 0 | is.na(allSet[,bsmtCols[2]])) & 
+                        (allSet[,bsmtCols[3]]== 0 | is.na(allSet[,bsmtCols[3]])) &
+                        (allSet[,bsmtCols[4]]== 0 | is.na(allSet[,bsmtCols[4]])) &
+                        (allSet[,bsmtCols[5]]== 0 | is.na(allSet[,bsmtCols[5]])) &
+                        (allSet[,bsmtCols[6]]== 0 | is.na(allSet[,bsmtCols[6]])) &
+                        (allSet[,bsmtCols[7]]== 0 | is.na(allSet[,bsmtCols[7]])) &
+                        (allSet[,bsmtCols[8]]== 0 | is.na(allSet[,bsmtCols[8]])) &
+                        (allSet[,bsmtCols[9]]== 0 | is.na(allSet[,bsmtCols[9]])) &
+                        (allSet[,bsmtCols[10]]== 0 | is.na(allSet[,bsmtCols[10]])) &
+                        (allSet[,bsmtCols[11]]== 0 | is.na(allSet[,bsmtCols[11]]))
+        )
+
+allSet[bsmtAllNa,c("BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2")] <- "None"
+allSet[bsmtAllNa, c("BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF", "BsmtFullBath", "BsmtHalfBath")] <- 0
+```
+
+Now, let's check remaining basement houses which have missing values but seem to have basements based on at least one non-NA basement feature.
+
+```{r}
+bsmtSmNa <- which(is.na(allSet[,bsmtCols[1]]) |
+                          is.na(allSet[,bsmtCols[2]]) | 
+                          is.na(allSet[,bsmtCols[3]]) | 
+                          is.na(allSet[,bsmtCols[4]]) |
+                          is.na(allSet[,bsmtCols[5]]) | 
+                          is.na(allSet[,bsmtCols[6]]) |
+                          is.na(allSet[,bsmtCols[7]]) | 
+                          is.na(allSet[,bsmtCols[8]]) | 
+                          is.na(allSet[,bsmtCols[9]]) |
+                          is.na(allSet[,bsmtCols[10]])| 
+                          is.na(allSet[,bsmtCols[11]]))
+bsmtNa <- allSet[bsmtSmNa,bsmtCols]
+bsmtNa
+```
+
+We have one house (333) whose *BsmtFinType2* value is missing while its *BsmtFinSF2* is 479 square feet. Let's see the distribution of all *BsmtFinType2* values versus *BsmtFinSF2*.
+
+```{r, warning = FALSE}
+missFinSF2 <- bsmtNa$BsmtFinSF2[is.na(bsmtNa$BsmtFinType2)]
+bsmt2 <- allSet[allSet$BsmtFinSF2 >0 & !is.na(allSet$BsmtFinType2), c("BsmtFinSF2", "BsmtFinType2")]
+bsmt2 %>% ggplot(aes(x = BsmtFinType2, y = BsmtFinSF2))+
+                geom_boxplot()+
+                geom_hline(yintercept = missFinSF2, color = "red")
+
+medSF <- bsmt2 %>% 
+        group_by(BsmtFinType2) %>% 
+        summarize(median = median(BsmtFinSF2))
+```
+
+Let's impute the missing rating of basement finished area (type2) based on the nearest median of square feet for the available type2 ratings.
+
+```{r}
+rIndx <- which(is.na(allSet$BsmtFinType2))
+
+for(i in rIndx){
+        bsmtVal <- medSF[which((abs(medSF$median - allSet$BsmtFinSF2[i])) == min(abs(medSF$median - allSet$BsmtFinSF2[i]), na.rm = T)),"BsmtFinType2"]
+         allSet$BsmtFinType2[i] <- bsmtVal[[1]]
+}
+```
+
+For basement exposure (*BsmtExposure*), we have 3 missing values. Let's see if there's any relationship between basement types and exposure.
+
+```{r,warning = FALSE}
+allSet[!is.na(allSet$BsmtExposure), c("BsmtExposure","BsmtFinType1")] %>% 
+        ggplot(aes(x = BsmtExposure, fill = BsmtFinType1))+
+        geom_histogram(stat = "count")
+```
+
+From the histogram above, we can see that the majority of houses have no basement exposure, and the majority of the no-basement exposure houses are *Unf* basement finish type, which match the 3 missing values of basement exposure. So, we'll impute the missing values with "No".
+
+```{r}
+allSet$BsmtExposure[is.na(allSet$BsmtExposure)] <- "No"
+```
+
+Then taking *TA* as the value of the missing basement quality houses.
+
+```{r}
+allSet$BsmtQual[is.na(allSet$BsmtQual)] <- "TA"
+```
+
+The majority of *TA* and *Gd* quality have *TA* basement condition. So, we'll use *TA* basement condition for the missing values.
+
+```{r}
+allSet$BsmtCond[is.na(allSet$BsmtCond)] <- "TA"
+```
+
+# Feature Engineering
+
+## Apply log transformation on skewed variables
+
+```{r}
+allSetNew <- allSet
+
+featureClasses <- sapply(names(allSetNew), function(x){class(allSetNew[[x]])})
+
+numFeatures <- names(featureClasses[featureClasses == "numeric" | featureClasses == "integer"])
+
+charFeatures <- names(featureClasses[featureClasses == "character"])
+
+skewedVals <- sapply(numFeatures, function(x){skewness(allSetNew[[x]],na.rm = T)})
+
+skewedFeatures <- skewedVals[skewedVals < -2 | skewedVals > 2]
+
+for (i in names(skewedFeatures)) {
+        allSetNew[[i]] <- log(allSetNew[[i]] + 1)
+}
+```
+
+## Change some character features into dummy variables
+
+```{r}
+dummies <- dummyVars(~., allSetNew[charFeatures])
+dummyVariables <- predict(dummies, allSetNew[charFeatures])
+
+allSetNew <- cbind(allSetNew[numFeatures], dummyVariables)
+```
+
+# Machine learning modeling
+
+First, I will re-split the full data set into its original *train* and *test* sets.
+
+```{r}
+salesPriceNA <- which(is.na(allSetNew["SalePrice"]))
+train <- allSetNew[-salesPriceNA,]
+test <- allSetNew[salesPriceNA,]
+```
+
+## Ridge Regression
+
+Ridge Regression is a remedial measure taken to alleviate multicollinearity amongst regression predictor variables in a model. 
+
+```{r}
+train.Matrix =as.matrix(train[,names(train) != c("Id","SalePrice")])
+test.Matrix = as.matrix(test[,names(test) != c("Id","SalePrice")])
+
+train.y = log(train$SalePrice + 1)
+```
+
+```{r}
+set.seed(4)
+
+grid = 10^seq(10,-2, length = 100)
+
+ridge.mod <- glmnet(train.Matrix,train.y,alpha = 0, lambda = grid)
+dim(coef(ridge.mod))
+```
+
+We have 303 regression coefficients with 100 lambda values. Then, I will split the *train* data set into *training* and *testing* subsets to estimate the test error.
+
+```{r}
+set.seed(5)
+nTrain <- round(0.75 * nrow(train.Matrix))
+sampleTrain <- sample(nrow(train.Matrix),nTrain)
+training <- train.Matrix[sampleTrain,]
+testing <- train.Matrix[-sampleTrain,]
+training.y <- train.y[sampleTrain]
+testing.y <- train.y[-sampleTrain]
+```
+
+
+```{r}
+set.seed(1)
+cv.out <- cv.glmnet(training, training.y, alpha = 0)
+plot(cv.out)
+ridgeBestLambda <- cv.out$lambda.min
+ridgeBestLambda;log(ridgeBestLambda)
+```
+
+The best lambda value is *`r ridgeBestLambda`*. Let's see the test *RMSE* associated with this value of lambda.
+
+```{r}
+ridge.predict <- predict(ridge.mod,s = ridgeBestLambda, newx = testing)
+ridge.rmse <- sqrt(mean((ridge.predict-testing.y)^2))
+ridge.rmse
+```
+
+So, the test error (*RMSE*) resulted from the Ridge Regression model on the testing data is *`r ridge.rmse`*.
+
+## Lasso Regression
+
+LASSO is a regression analysis method that performs both variable selection and regularization in order to enhance the prediction accuracy and interpretability of the statistical model it produces. 
+
+```{r}
+set.seed(5)
+lasso.mod = glmnet(train.Matrix,train.y,alpha = 1, lambda = grid)
+plot(lasso.mod)
+```
+
+Then, let's perform cross validation and see the test error.
+
+```{r}
+set.seed(1)
+cv.out <- cv.glmnet(training, training.y, alpha = 1)
+plot(cv.out)
+lassoBestlambda <- cv.out$lambda.min
+lassoBestlambda;log(lassoBestlambda)
+```
+
+The best lambda value that results in the smallest cross validation error is *`r lassoBestlambda`*. 
+
+```{r}
+lasso.predict <- predict(lasso.mod,s = lassoBestlambda, newx = testing)
+lasso.rmse <- sqrt(mean((lasso.predict-testing.y)^2))
+lasso.rmse
+```
+So, the RMSE resulted from the Lasso Regression model is *`r lasso.rmse`* which is slightly higher than that of the Ridge Regression.
+
+```{r}
+lasso.coef <- predict(lasso.mod,type = "coefficients", s = lassoBestlambda)[1:303,]
+names(lasso.coef[lasso.coef !=0])
+```
+
+Number of coefficients that the Lasso Regression picked (not zero) is 54.
+
+## Gradient Boosting Machine (GBM) Algorithm
+
+Gradient boosting is a machine learning technique for regression and classification problems, which produces a prediction model in the form of an ensemble of weak prediction models, typically decision trees. 
+
+```{r}
+set.seed(5)
+# re-split the combined data
+salesPriceNA <- which(is.na(allSetNew["SalePrice"]))
+train <- allSetNew[-salesPriceNA,]
+test <- allSetNew[salesPriceNA,]
+ 
+train$SalePrice <- log(train$SalePrice + 1)
+
+nTrain <- round(0.75 * nrow(train))
+
+sampleTrain <- sample(nrow(train),nTrain)
+
+training <- train[sampleTrain,!names(train) == "Id"]
+testing <- train[-sampleTrain,!names(train) == "Id"]
+ 
+testing.y <- testing$SalePrice
+```
+
+Build the *GBM* model.
+ 
+```{r,warning=FALSE}
+set.seed(2)
+control <- trainControl(method = "repeatedcv", number = 10, repeats = 5, verboseIter = FALSE)
+ 
+gbm.mod <- train(SalePrice~., data = training, method = "gbm", trControl = control, verbose = FALSE)
+ 
+gbm.mod
+```
+ 
+Let's see the test error (RMSE) by applying the GBM model to the testing data set.
+ 
+```{r}
+gbm.predict <- predict(gbm.mod,newdata = testing)
+gbm.rmse <- sqrt(mean((gbm.predict-testing.y)^2))
+gbm.rmse
+```
+ 
+Therefore, GBM model resulted in a worse prediction than that of both Ridge and Lasso.
+
+## Linear Model with Forward Stepwise
+
+The term "linear" refers to the fact that we are fitting a line. The term model refers to the equation that summarizes the line that we fit.
+
+```{r,warning = FALSE,results='hide'}
+set.seed(4)
+
+null_model <- lm(SalePrice~1, data = training)
+
+full_model <- lm(SalePrice~., data = training)
+ 
+step_model <- step(null_model, scope = list(lower = null_model, upper = full_model), direction = "forward")
+```
+ 
+Let's see the test error (RMSE) by applying the Step Wise model to the testing data set.
+ 
+```{r}
+step.predict <- predict(step_model,newdata = testing)
+step.rmse <- sqrt(mean((step.predict-testing.y)^2))
+step.rmse
+```
+ 
+The RMSE resulted from the Linear model with Forward Stepwise is *`r step.rmse`*.
+ 
+# Model predicting on the test data
+ 
+By now we have trained and tested four models. We will use each one to predict the Sale Price response variable in the original *test* data set.
+
+```{r}
+test.predict.step <- exp(predict(step_model,newdata = test)) - 1
+
+test.predict.ridge <- exp(predict(ridge.mod,s = ridgeBestLambda,newx = test.Matrix))-1
+ 
+test.predict.lasso <- exp(predict(lasso.mod, s = lassoBestlambda, newx = test.Matrix))-1
+ 
+test.predict.gbm <- exp(predict(gbm.mod,newdata = test)) - 1
+```
+ 
+
+# Models Ensembling and getting the outcome
+
+Ensemble methods use multiple learning algorithms to obtain better predictive performance than could be obtained from any of the constituent learning algorithms alone.
+
+```{r}
+ensmb.df <- data.frame(Model = c("ridge", "lasso", "gbm", "step"), RMSE = c(ridge.rmse,lasso.rmse,gbm.rmse,step.rmse), Weight = c(40,30,15,15))
+
+solution <- data.frame(Id = as.integer(rownames(test)),SalePrice =  as.numeric(test.predict.ridge*.4 + test.predict.lasso*.3 + test.predict.gbm*.15 + test.predict.step*.15))
+```
+
+
